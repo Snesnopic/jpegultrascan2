@@ -162,7 +162,8 @@ jobs:
             cmake --build build --config Release --parallel "$(sysctl -n hw.ncpu)"
             ./build/jpegultrascan --help
             ldd build/jpegultrascan
-            if ldd build/jpegultrascan | grep -i jpeg; then
+            # freebsd's ldd starts with the binary's own name
+            if ldd build/jpegultrascan | tail -n +2 | grep -i jpeg; then
               echo "libjpeg is linked dynamically"
               exit 1
             fi

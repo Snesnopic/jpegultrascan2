@@ -159,7 +159,7 @@ jobs:
           run: |
             set -e
             cmake -B build -DCMAKE_BUILD_TYPE=Release
-            cmake --build build --config Release --parallel
+            cmake --build build --config Release --parallel "$(sysctl -n hw.ncpu)"
             ./build/jpegultrascan --help
             ldd build/jpegultrascan
             if ldd build/jpegultrascan | grep -i jpeg; then
@@ -192,8 +192,9 @@ jobs:
       - name: Configure CMake
         run: cmake -S .github/mozjpeg_parent -B build-moz -DCMAKE_BUILD_TYPE=Release
 
+      # EXCLUDE_FROM_ALL keeps our targets out of the parent's Visual Studio solution
       - name: Build
-        run: cmake --build build-moz --config Release --target jpegultrascan --parallel
+        run: cmake --build build-moz/jpegultrascancpp --config Release --target jpegultrascan --parallel
 
   release:
     name: Publish release

@@ -240,6 +240,11 @@ std::size_t Decoder::trailing_bytes() const {
 
 bool encode(const Source& source, std::span<const jpeg_scan_info> scans, Markers markers,
             std::vector<std::uint8_t>& out, std::string& error) {
+    if (scans.size() > kMaxScans) {
+        error = "mozjpeg can't encode more than " + std::to_string(kMaxScans) + " scans";
+        out.clear();
+        return false;
+    }
     Encoder enc;
     init_error_manager(enc.err);
     enc.cinfo.err = &enc.err.pub;

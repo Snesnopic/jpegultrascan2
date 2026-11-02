@@ -9,10 +9,9 @@ Working name; meant to become a submodule of [chisel](https://github.com/Snesnop
 
 ## Status
 
-Work in progress. The search is a line-by-line port of the Perl script's. Two engines measure
-the scans: engine A (`--engine libjpeg`, the default) encodes them with libjpeg, engine B
-(`--engine direct`) works out their sizes the way libjpeg-turbo's Huffman encoder would,
-without encoding, several times faster. Both give the Perl script's output byte for byte,
+Work in progress. The search is a line-by-line port of the Perl script's, but instead of
+encoding thousands of candidate scripts it works out each scan's size the way libjpeg-turbo's
+Huffman encoder would, without encoding. The result is the Perl script's output byte for byte,
 every scan size included, on all the images tested so far.
 
 ## Building
@@ -23,7 +22,9 @@ every scan size included, on all the images tested so far.
 Standalone, the build downloads and compiles libjpeg-turbo 3.2.0 as a static library. When a
 parent project already defines `JPEG::JPEG` (chisel does, with mozjpeg), that one is used
 instead: a binary can link only one libjpeg. mozjpeg is detected from its `jpeglib.h`, and its
-own scan search is switched off (`JCP_FASTEST`) before any encoding.
+own scan search is switched off (`JCP_FASTEST`) before any encoding. mozjpeg 4.1.5 can't
+encode more than 64 scans (it overruns an array past that): a longer script is not used, and
+the input is kept.
 
 Options: `JPEGULTRASCAN_BUILD_CLI`, `JPEGULTRASCAN_MOZJPEG` (`AUTO`, `ON`, `OFF`).
 

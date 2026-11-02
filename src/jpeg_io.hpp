@@ -86,8 +86,16 @@ enum class Markers {
     Jpegtran,  // `jpegtran -copy all`: its own JFIF or Adobe segment replaces the source's
 };
 
+// mozjpeg 4.1.5 records each scan's Al in an array of 64 (actual_Al in jcmaster.h) even when
+// it doesn't search scans itself, so a longer script overruns it
+#ifdef JPEGULTRASCAN_MOZJPEG
+inline constexpr std::size_t kMaxScans = 64;
+#else
+inline constexpr std::size_t kMaxScans = SIZE_MAX;
+#endif
+
 // encodes the decoder's coefficients with a scan script (sequential when empty) and
-// optimized Huffman tables, as jpegtran -optimize -scans does
+// optimized Huffman tables, as jpegtran -optimize -scans does; fails beyond kMaxScans scans
 bool encode(const Source& source, std::span<const jpeg_scan_info> scans, Markers markers,
             std::vector<std::uint8_t>& out, std::string& error);
 

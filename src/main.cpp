@@ -20,13 +20,11 @@ void usage() {
                "usage: jpegultrascan [options] input.jpg output.jpg\n"
                "  -b N               most successive-approximation bits per band (default 3)\n"
                "  -t N               threads, 0 for all cores (default 0)\n"
-               "  --engine E         libjpeg (reference) or direct\n"
                "  --dc MODE          upstream (default) or interleaved (like -i -1)\n"
                "  --markers MODE     keep (default): every APPn/COM segment as it is\n"
                "                     jpegtran: what jpegtran -copy all writes\n"
                "  --scans FILE       skip the search, encode with this script (jpegtran -scans syntax)\n"
                "  --log FILE         write what jpegultrascan.pl -v prints\n"
-               "  --perl-batches     engine A encodes the perl's exact scripts (slower, same result)\n"
                "  --sizes            print the size of each scan of the output\n"
                "  -q                 quiet\n"
                "The output is the input again when re-encoding doesn't make it smaller.\n",
@@ -63,7 +61,6 @@ int main(int argc, char** argv) {
     const char* log_path = nullptr;
     detail::Markers markers = detail::Markers::Keep;
     bool print_sizes = false;
-    bool perl_batches = false;
     bool quiet = false;
     std::vector<const char*> files;
     for (int i = 1; i < argc; ++i) {
@@ -73,14 +70,6 @@ int main(int argc, char** argv) {
             options.max_bits = std::atoi(argv[++i]);
         } else if (arg == "-t" && has_value) {
             options.threads = static_cast<unsigned>(std::atoi(argv[++i]));
-        } else if (arg == "--engine" && has_value) {
-            const std::string e = argv[++i];
-            if (e == "libjpeg") options.engine = Engine::Libjpeg;
-            else if (e == "direct") options.engine = Engine::Direct;
-            else {
-                usage();
-                return 2;
-            }
         } else if (arg == "--dc" && has_value) {
             const std::string m = argv[++i];
             if (m == "upstream") options.dc = DcScans::Upstream;
@@ -101,8 +90,6 @@ int main(int argc, char** argv) {
             scans_path = argv[++i];
         } else if (arg == "--log" && has_value) {
             log_path = argv[++i];
-        } else if (arg == "--perl-batches") {
-            perl_batches = true;
         } else if (arg == "--sizes") {
             print_sizes = true;
         } else if (arg == "-q") {
@@ -141,7 +128,6 @@ int main(int argc, char** argv) {
     VerboseLog log;
     log.width = source.info()->num_components * 2 + 10;
     log.width2 = static_cast<int>(std::to_string(input.size()).size());
-    Stats stats;
     std::string error;
     if (scans_path) {
         std::vector<std::uint8_t> text;
@@ -156,8 +142,7 @@ int main(int argc, char** argv) {
         }
         scans = *parsed;
     } else {
-        auto script = detail::find_best_script(source.source(), options, log_path ? &log : nullptr, &stats, error,
-                                               perl_batches);
+        auto script = detail::find_best_script(source.source(), options, log_path ? &log : nullptr, error);
         if (!script) {
             std::fprintf(stderr, "%s: %s\n", files[0], error.c_str());
             return 1;
@@ -166,20 +151,24 @@ int main(int argc, char** argv) {
     }
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 
+    // beyond mozjpeg's limit the input stays as it is; a script given by hand fails instead
+    const bool encodable = scans.size() <= kMaxScans || scans_path != nullptr;
     std::vector<std::uint8_t> output;
-    if (!encode(source.source(), scans, markers, output, error)) {
+    if (!encodable) output = input;
+    else if (!encode(source.source(), scans, markers, output, error)) {
         std::fprintf(stderr, "%s: %s\n", files[0], error.c_str());
         return 1;
     }
     Decoder check;
     std::string why;
-    if (!check.read(output, true) || !same_image(source, check, markers == detail::Markers::Keep, why)) {
+    if (encodable &&
+        (!check.read(output, true) || !same_image(source, check, markers == detail::Markers::Keep, why))) {
         std::fprintf(stderr, "%s: output check failed: %s\n", files[0],
                      why.empty() ? check.error().c_str() : why.c_str());
         return 1;
     }
     const std::size_t encoded = output.size();
-    const bool improved = encoded <= input.size();
+    const bool improved = encodable && encoded <= input.size();
     if (!write_file(files[1], improved ? output : input)) {
         std::fprintf(stderr, "can't write %s\n", files[1]);
         return 1;
@@ -207,10 +196,10 @@ int main(int argc, char** argv) {
         }
     }
     if (!quiet) {
-        std::fprintf(stderr, "%s: %zu -> %zu bytes, %zu scans, %.2f s search, %zu encodes%s%s\n", files[0], input.size(),
-                     improved ? encoded : input.size(), scans.size(), seconds, stats.encodes,
-                     improved ? "" : " (kept the input)",
-                     stats.inconsistencies ? ", SCAN SIZES DEPEND ON THE SCRIPT" : "");
+        std::fprintf(stderr, "%s: %zu -> %zu bytes, %zu scans, %.2f s search%s\n", files[0], input.size(),
+                     improved ? encoded : input.size(), scans.size(), seconds,
+                     !encodable ? " (kept the input: mozjpeg can't encode that many scans)"
+                     : improved ? "" : " (kept the input)");
     }
-    return stats.inconsistencies ? 3 : 0;
+    return 0;
 }

@@ -3,7 +3,6 @@
 #include <algorithm>
 
 #include "engine_direct.hpp"
-#include "engine_libjpeg.hpp"
 #include "pipeline.hpp"
 
 namespace jpegultrascan {
@@ -15,29 +14,23 @@ int max_bits_for(const jpeg_decompress_struct& info, int requested) {
     return std::clamp(requested, 0, info.data_precision == 12 ? 13 : 10);
 }
 
-std::optional<Script> find_best_script(const Source& source, const Options& options, VerboseLog* log,
-                                       Stats* stats, std::string& error, bool perl_batches) {
-    const jpeg_decompress_struct& info = *source.info;
+SearchOptions search_options_for(const jpeg_decompress_struct& info, const Options& options, VerboseLog* log) {
     SearchOptions search_options;
     search_options.max_bits = max_bits_for(info, options.max_bits);
     search_options.dc = options.dc == DcScans::Interleaved ? DcMode::Interleaved : DcMode::Upstream;
     search_options.log = log;
-    if (options.engine == Engine::Direct) {
-        DirectEngine engine(source, search_options.max_bits, options.threads, log);
-        if (!engine.ok()) {
-            error = engine.error();
-            return std::nullopt;
-        }
-        auto found = search(engine, info.num_components, search_options, error);
-        if (!found) return std::nullopt;
-        return Script{std::move(found->scans), static_cast<std::size_t>(found->bytes)};
+    return search_options;
+}
+
+std::optional<Script> find_best_script(const Source& source, const Options& options, VerboseLog* log,
+                                       std::string& error) {
+    const SearchOptions search_options = search_options_for(*source.info, options, log);
+    DirectEngine engine(source, search_options.max_bits, options.threads, log);
+    if (!engine.ok()) {
+        error = engine.error();
+        return std::nullopt;
     }
-    LibjpegEngine engine(source, search_options.max_bits, options.threads, log, perl_batches);
-    auto found = search(engine, info.num_components, search_options, error);
-    if (stats) {
-        stats->encodes = engine.encodes();
-        stats->inconsistencies = engine.inconsistencies();
-    }
+    auto found = search(engine, source.info->num_components, search_options, error);
     if (!found) return std::nullopt;
     return Script{std::move(found->scans), static_cast<std::size_t>(found->bytes)};
 }
@@ -50,7 +43,9 @@ std::optional<Script> find_best_script(j_decompress_ptr source, jvirt_barray_ptr
         detail::Source src{source, coefficients, {}};
         std::string error;
         if (!detail::collect_planes(src, error)) return std::nullopt;
-        return detail::find_best_script(src, options, nullptr, nullptr, error);
+        auto script = detail::find_best_script(src, options, nullptr, error);
+        if (script && script->scans.size() > detail::kMaxScans) return std::nullopt;
+        return script;
     } catch (...) {
         return std::nullopt;
     }
@@ -66,10 +61,15 @@ std::optional<Result> optimize(std::span<const std::uint8_t> jpeg, const Options
             err = source.error();
             return std::nullopt;
         }
-        auto script = detail::find_best_script(source.source(), options, nullptr, nullptr, err);
+        auto script = detail::find_best_script(source.source(), options, nullptr, err);
         if (!script) return std::nullopt;
-        const detail::Markers mode = markers == Markers::Keep ? detail::Markers::Keep : detail::Markers::Jpegtran;
         Result result;
+        if (script->scans.size() > detail::kMaxScans) {
+            result.data.assign(jpeg.begin(), jpeg.end());
+            result.script = std::move(*script);
+            return result;
+        }
+        const detail::Markers mode = markers == Markers::Keep ? detail::Markers::Keep : detail::Markers::Jpegtran;
         if (!detail::encode(source.source(), script->scans, mode, result.data, err)) return std::nullopt;
         detail::Decoder check;
         if (!check.read(result.data, true)) {

@@ -28,7 +28,6 @@ find_package(Threads REQUIRED)
 
 add_library(jpegultrascan_core STATIC
     src/engine_direct.cpp
-    src/engine_libjpeg.cpp
     src/jpeg_io.cpp
     src/jpegultrascan.cpp
     src/scan_script.cpp

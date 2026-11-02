@@ -569,7 +569,7 @@ DirectEngine::Job make_job(const std::vector<int>& comps, int ss, int se, int ah
     return job;
 }
 
-// the "0 1 2: 0 0 0 9;" scans engine A puts in front of the scans it measures: only for the
+// the "0 1 2: 0 0 0 9;" scans jpegultrascan.pl puts in front of the scans it measures: only for the
 // log, which has their sizes too
 void add_dummies(std::vector<DirectEngine::Job>& jobs, const std::vector<int>& comps) {
     for (std::size_t i = 0; i < comps.size(); i += MAX_COMPS_IN_SCAN) {

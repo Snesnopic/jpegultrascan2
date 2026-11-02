@@ -1,0 +1,216 @@
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <iterator>
+#include <string>
+#include <vector>
+
+#include "jpeg_io.hpp"
+#include "pipeline.hpp"
+#include "scan_script.hpp"
+
+namespace {
+
+using namespace jpegultrascan;
+using namespace jpegultrascan::detail;
+
+void usage() {
+    std::fputs("jpegultrascan " JPEGULTRASCAN_VERSION "\n"
+               "usage: jpegultrascan [options] input.jpg output.jpg\n"
+               "  -b N               most successive-approximation bits per band (default 3)\n"
+               "  -t N               threads, 0 for all cores (default 0)\n"
+               "  --engine E         libjpeg (reference) or direct\n"
+               "  --dc MODE          upstream (default) or interleaved (like -i -1)\n"
+               "  --markers MODE     keep (default): every APPn/COM segment as it is\n"
+               "                     jpegtran: what jpegtran -copy all writes\n"
+               "  --scans FILE       skip the search, encode with this script (jpegtran -scans syntax)\n"
+               "  --log FILE         write what jpegultrascan.pl -v prints\n"
+               "  --perl-batches     engine A encodes the perl's exact scripts (slower, same result)\n"
+               "  --sizes            print the size of each scan of the output\n"
+               "  -q                 quiet\n"
+               "The output is the input again when re-encoding doesn't make it smaller.\n",
+               stderr);
+}
+
+bool read_file(const char* path, std::vector<std::uint8_t>& data) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    return !in.bad();
+}
+
+bool write_file(const char* path, const std::vector<std::uint8_t>& data) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    out.close();
+    return !out.fail();
+}
+
+bool write_text(const char* path, const std::vector<std::string>& lines) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    for (const std::string& l : lines) out << l << '\n';
+    out.close();
+    return !out.fail();
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    Options options;
+    const char* scans_path = nullptr;
+    const char* log_path = nullptr;
+    detail::Markers markers = detail::Markers::Keep;
+    bool print_sizes = false;
+    bool perl_batches = false;
+    bool quiet = false;
+    std::vector<const char*> files;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        const bool has_value = i + 1 < argc;
+        if (arg == "-b" && has_value) {
+            options.max_bits = std::atoi(argv[++i]);
+        } else if (arg == "-t" && has_value) {
+            options.threads = static_cast<unsigned>(std::atoi(argv[++i]));
+        } else if (arg == "--engine" && has_value) {
+            const std::string e = argv[++i];
+            if (e == "libjpeg") options.engine = Engine::Libjpeg;
+            else if (e == "direct") options.engine = Engine::Direct;
+            else {
+                usage();
+                return 2;
+            }
+        } else if (arg == "--dc" && has_value) {
+            const std::string m = argv[++i];
+            if (m == "upstream") options.dc = DcScans::Upstream;
+            else if (m == "interleaved") options.dc = DcScans::Interleaved;
+            else {
+                usage();
+                return 2;
+            }
+        } else if (arg == "--markers" && has_value) {
+            const std::string m = argv[++i];
+            if (m == "keep") markers = detail::Markers::Keep;
+            else if (m == "jpegtran") markers = detail::Markers::Jpegtran;
+            else {
+                usage();
+                return 2;
+            }
+        } else if (arg == "--scans" && has_value) {
+            scans_path = argv[++i];
+        } else if (arg == "--log" && has_value) {
+            log_path = argv[++i];
+        } else if (arg == "--perl-batches") {
+            perl_batches = true;
+        } else if (arg == "--sizes") {
+            print_sizes = true;
+        } else if (arg == "-q") {
+            quiet = true;
+        } else if (arg == "-h" || arg == "--help") {
+            usage();
+            return 0;
+        } else if (!arg.empty() && arg[0] == '-' && arg != "-") {
+            usage();
+            return 2;
+        } else {
+            files.push_back(argv[i]);
+        }
+    }
+    if (files.size() != 2) {
+        usage();
+        return 2;
+    }
+
+    std::vector<std::uint8_t> input;
+    if (!read_file(files[0], input)) {
+        std::fprintf(stderr, "can't read %s\n", files[0]);
+        return 1;
+    }
+    Decoder source;
+    if (!source.read(input, true)) {
+        std::fprintf(stderr, "%s: %s\n", files[0], source.error().c_str());
+        return 1;
+    }
+    if (source.warnings() && !quiet) {
+        std::fprintf(stderr, "%s: libjpeg warns: %s\n", files[0], source.last_message());
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<jpeg_scan_info> scans;
+    VerboseLog log;
+    log.width = source.info()->num_components * 2 + 10;
+    log.width2 = static_cast<int>(std::to_string(input.size()).size());
+    Stats stats;
+    std::string error;
+    if (scans_path) {
+        std::vector<std::uint8_t> text;
+        if (!read_file(scans_path, text)) {
+            std::fprintf(stderr, "can't read %s\n", scans_path);
+            return 1;
+        }
+        const auto parsed = parse_scan_script(std::string_view(reinterpret_cast<const char*>(text.data()), text.size()));
+        if (!parsed) {
+            std::fprintf(stderr, "bad scan script %s\n", scans_path);
+            return 1;
+        }
+        scans = *parsed;
+    } else {
+        auto script = detail::find_best_script(source.source(), options, log_path ? &log : nullptr, &stats, error,
+                                               perl_batches);
+        if (!script) {
+            std::fprintf(stderr, "%s: %s\n", files[0], error.c_str());
+            return 1;
+        }
+        scans = std::move(script->scans);
+    }
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+
+    std::vector<std::uint8_t> output;
+    if (!encode(source.source(), scans, markers, output, error)) {
+        std::fprintf(stderr, "%s: %s\n", files[0], error.c_str());
+        return 1;
+    }
+    Decoder check;
+    std::string why;
+    if (!check.read(output, true) || !same_image(source, check, markers == detail::Markers::Keep, why)) {
+        std::fprintf(stderr, "%s: output check failed: %s\n", files[0],
+                     why.empty() ? check.error().c_str() : why.c_str());
+        return 1;
+    }
+    const std::size_t encoded = output.size();
+    const bool improved = encoded <= input.size();
+    if (!write_file(files[1], improved ? output : input)) {
+        std::fprintf(stderr, "can't write %s\n", files[1]);
+        return 1;
+    }
+    if (log_path) {
+        std::vector<std::string> lines = log.sizes;
+        lines.push_back("--");
+        lines.insert(lines.end(), log.summary.begin(), log.summary.end());
+        lines.push_back("Best scans:");
+        for (const auto& s : scans) lines.push_back(format_scan(s));
+        lines.push_back("Size: " + std::to_string(encoded) + " bytes");
+        char change[64];
+        std::snprintf(change, sizeof change, "Change: %+.6f%%",
+                      (static_cast<double>(encoded) / static_cast<double>(input.size()) - 1) * 100);
+        lines.push_back(change);
+        if (!write_text(log_path, lines)) {
+            std::fprintf(stderr, "can't write %s\n", log_path);
+            return 1;
+        }
+    }
+    if (print_sizes) {
+        const auto sizes = scan_sizes(output);
+        for (std::size_t i = 0; i < sizes.size(); ++i) {
+            std::printf("%s %zu\n", i < scans.size() ? format_scan(scans[i]).c_str() : "?", sizes[i]);
+        }
+    }
+    if (!quiet) {
+        std::fprintf(stderr, "%s: %zu -> %zu bytes, %zu scans, %.2f s search, %zu encodes%s%s\n", files[0], input.size(),
+                     improved ? encoded : input.size(), scans.size(), seconds, stats.encodes,
+                     improved ? "" : " (kept the input)",
+                     stats.inconsistencies ? ", SCAN SIZES DEPEND ON THE SCRIPT" : "");
+    }
+    return stats.inconsistencies ? 3 : 0;
+}

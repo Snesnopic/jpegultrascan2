@@ -1,0 +1,256 @@
+name: Multi-platform build
+
+on:
+  push:
+    branches: [ "**" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.asset_name }})
+    runs-on: ${{ matrix.runs_on }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset_name: linux-x64-gcc
+            runs_on: ubuntu-24.04
+            cmake_args: -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+            binary_path: build/jpegultrascan
+
+          - asset_name: linux-x64-clang
+            runs_on: ubuntu-24.04
+            cmake_args: -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+            binary_path: build/jpegultrascan
+
+          - asset_name: linux-arm64
+            runs_on: ubuntu-24.04-arm
+            cmake_args: -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+            binary_path: build/jpegultrascan
+
+          - asset_name: linux-x86
+            runs_on: ubuntu-24.04
+            cmake_args: -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32
+            install_deps: sudo apt-get update && sudo apt-get install -y g++-multilib
+            binary_path: build/jpegultrascan
+
+          - asset_name: macos-x64
+            runs_on: macos-15-intel
+            cmake_args: -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+            binary_path: build/jpegultrascan
+
+          - asset_name: macos-arm64
+            runs_on: macos-15
+            cmake_args: -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+            binary_path: build/jpegultrascan
+
+          - asset_name: windows-x64
+            runs_on: windows-latest
+            cmake_args: -A x64
+            msvc_arch: x64
+            binary_path: build/Release/jpegultrascan.exe
+
+          - asset_name: windows-x86
+            runs_on: windows-latest
+            cmake_args: -A Win32
+            msvc_arch: x64
+            binary_path: build/Release/jpegultrascan.exe
+
+          - asset_name: windows-arm64
+            runs_on: windows-11-arm
+            cmake_args: -A ARM64
+            msvc_arch: arm64
+            binary_path: build/Release/jpegultrascan.exe
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        if: matrix.install_deps
+        run: ${{ matrix.install_deps }}
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Check that the binary runs
+        shell: bash
+        run: ./${{ matrix.binary_path }} --help
+
+      # libjpeg and, on Windows, the C++ runtime have to be linked in
+      - name: Verify static linking (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          ldd ${{ matrix.binary_path }}
+          if ldd ${{ matrix.binary_path }} | grep -iE "jpeg"; then
+            echo "::error::libjpeg is linked dynamically"
+            exit 1
+          fi
+
+      - name: Verify static linking (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          otool -L ${{ matrix.binary_path }}
+          if otool -L ${{ matrix.binary_path }} | tail -n +2 | grep -iE "jpeg"; then
+            echo "::error::libjpeg is linked dynamically"
+            exit 1
+          fi
+          vtool -show-build ${{ matrix.binary_path }}
+
+      - name: Setup MSVC Developer Environment
+        if: runner.os == 'Windows'
+        uses: TheMrMilchmann/setup-msvc-dev@v4
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      - name: Verify static linking (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $deps = & dumpbin /dependents "${{ matrix.binary_path }}" | Select-String -Pattern '\.dll'
+          $deps | ForEach-Object { $_.Line.Trim() }
+          $bad = $deps | Select-String -Pattern 'jpeg|vcruntime|msvcp'
+          if ($bad) {
+            Write-Error "linked dynamically: $($bad -join ', ')"
+            exit 1
+          }
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.asset_name }}
+          path: ${{ matrix.binary_path }}
+          if-no-files-found: error
+
+  build-freebsd:
+    name: build (${{ matrix.asset_name }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset_name: freebsd-x64
+            arch: amd64
+          - asset_name: freebsd-arm64
+            arch: arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Build on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          arch: ${{ matrix.arch }}
+          release: "15.1"
+          usesh: true
+          prepare: pkg install -y cmake
+          run: |
+            set -e
+            cmake -B build -DCMAKE_BUILD_TYPE=Release
+            cmake --build build --config Release --parallel
+            ./build/jpegultrascan --help
+            ldd build/jpegultrascan
+            if ldd build/jpegultrascan | grep -i jpeg; then
+              echo "libjpeg is linked dynamically"
+              exit 1
+            fi
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.asset_name }}
+          path: build/jpegultrascan
+          if-no-files-found: error
+
+  # chisel links mozjpeg and defines JPEG::JPEG before adding this directory; the parent
+  # project under .github/mozjpeg_parent does the same, so that path keeps building
+  mozjpeg-parent:
+    name: inside a mozjpeg parent (${{ matrix.runs_on }})
+    runs-on: ${{ matrix.runs_on }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        runs_on: [ ubuntu-24.04, macos-15, windows-latest ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Configure CMake
+        run: cmake -S .github/mozjpeg_parent -B build-moz -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build-moz --config Release --target jpegultrascan --parallel
+
+  release:
+    name: Publish release
+    needs: [ build, build-freebsd, mozjpeg-parent ]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Check the tag against the project version
+        run: |
+          version=$(sed -nE 's/^project\(jpegultrascancpp VERSION ([0-9.]+).*/\1/p' CMakeLists.txt)
+          tag=${GITHUB_REF_NAME#v}
+          if [ "${tag%%-*}" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match the project version $version"
+            exit 1
+          fi
+
+      - name: Download all binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*
+          path: artifacts
+
+      # the licenses travel with each binary: Apache-2.0 asks for NOTICE, libjpeg-turbo
+      # (linked in statically) for its own license and the IJG acknowledgement
+      - name: Package
+        run: |
+          mkdir -p stage release
+          for dir in artifacts/binary-*; do
+            name=jpegultrascan-${dir#artifacts/binary-}-$GITHUB_REF_NAME
+            mkdir -p "stage/$name/licenses"
+            cp LICENSE NOTICE "stage/$name/"
+            cp -R licenses/libjpeg-turbo "stage/$name/licenses/"
+            if [ -f "$dir/jpegultrascan.exe" ]; then
+              cp "$dir/jpegultrascan.exe" "stage/$name/"
+              (cd stage && zip -qr "../release/$name.zip" "$name")
+            else
+              cp "$dir/jpegultrascan" "stage/$name/"
+              chmod +x "stage/$name/jpegultrascan"
+              tar -czf "release/$name.tar.gz" -C stage "$name"
+            fi
+          done
+          ls -l release
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          prerelease=
+          case "$GITHUB_REF_NAME" in *-*) prerelease=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" $prerelease \
+            --title "jpegultrascan $GITHUB_REF_NAME" \
+            --generate-notes \
+            release/*

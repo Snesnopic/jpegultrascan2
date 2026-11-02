@@ -1,0 +1,16 @@
+jpegultrascancpp
+Based on jpegultrascan by Aaron Kaluszka.
+
+jpegultrascan 1.4.0 (https://github.com/MegaByte/jpegultrascan, commit c35ab48)
+Copyright 2015-2024 Aaron Kaluszka
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This project is a C++ port of that script's scan search. Files derived from it
+carry a notice at the top saying so.
+
+src/engine_direct.cpp follows the Huffman encoders of libjpeg-turbo 3.2.0
+(jcphuff.c, jchuff.c, jcmarker.c, jctrans.c). This software is based in part on
+the work of the Independent JPEG Group. The libjpeg-turbo and IJG license texts
+are in licenses/libjpeg-turbo.
+
+Binaries built standalone also include libjpeg-turbo itself.

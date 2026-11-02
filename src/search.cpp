@@ -96,7 +96,7 @@ enum class Pick { Left, Right, Neither };
 Pick choosebest(std::uint64_t leftsize, std::size_t leftcount, std::uint64_t rightsize, std::size_t rightcount) {
     if (!leftsize && !rightsize) return Pick::Neither;
     if (!rightsize || (leftsize && leftsize < rightsize)) return Pick::Left;
-    if (!leftsize || (rightsize && leftsize > rightsize) || leftcount > rightcount) return Pick::Right;
+    if (!leftsize || leftsize > rightsize || leftcount > rightcount) return Pick::Right;
     return Pick::Left;
 }
 
@@ -244,7 +244,7 @@ std::optional<SearchResult> search(SizeSource& source, int num_components, const
     Candidate acall{0, 0, -1};
     for (int p = 0; p <= planes; ++p) {
         if (log) log->summary.push_back("Calculating sizes of AC scans, plane " + std::to_string(p));
-        auto sizes = std::make_shared<AcSizes>(max_bits);
+        const auto sizes = std::make_shared<AcSizes>(max_bits);
         if (!source.measure_ac(p, *sizes)) {
             error = std::string("measuring AC scans failed: ") + source.error();
             return std::nullopt;
@@ -264,7 +264,7 @@ std::optional<SearchResult> search(SizeSource& source, int num_components, const
     }
 
     // dc scans and the sequential scripts, partition by partition
-    if (log) log->summary.push_back("Calculating sizes and searching for best DC scan");
+    if (log) log->summary.emplace_back("Calculating sizes and searching for best DC scan");
     Candidate best{kInfinity, 0, -1};
     std::map<std::string, Candidate> dc_best;
     std::map<std::string, std::uint64_t> sequential;
@@ -273,7 +273,7 @@ std::optional<SearchResult> search(SizeSource& source, int num_components, const
         for (const std::string& part : parts) {
             auto it = dc_best.find(part);
             if (it == dc_best.end()) {
-                auto dc = std::make_shared<std::vector<std::uint64_t>>(static_cast<std::size_t>(pass_count(max_bits)), 0);
+                const auto dc = std::make_shared<std::vector<std::uint64_t>>(static_cast<std::size_t>(pass_count(max_bits)), 0);
                 if (!source.measure_dc(components_of(part), *dc)) {
                     error = std::string("measuring DC scans failed: ") + source.error();
                     return false;
@@ -290,9 +290,10 @@ std::optional<SearchResult> search(SizeSource& source, int num_components, const
                  [&] { return arena.concat(dcall.node, acall.node); });
 
         bool measured = true;
-        for (const std::string& part : parts) measured = measured && sequential.count(part + ";");
+        for (const std::string& part : parts) measured = measured && sequential.contains(part + ";");
         if (!measured) {
             std::vector<std::vector<int>> comps;
+            comps.reserve(parts.size());
             for (const std::string& part : parts) comps.push_back(components_of(part));
             std::vector<std::uint64_t> sizes;
             if (!source.measure_sequential(comps, sizes) || sizes.size() != parts.size()) {
@@ -332,7 +333,7 @@ std::optional<SearchResult> search(SizeSource& source, int num_components, const
         const std::size_t at = text.find(ac);
         if (at != std::string::npos && !ac.empty()) {
             const std::string dc = text.substr(0, at) + text.substr(at + ac.size());
-            log->summary.push_back("Best DC scan:");
+            log->summary.emplace_back("Best DC scan:");
             std::size_t start = 0;
             while (start < dc.size()) {
                 const std::size_t end = dc.find('\n', start);
@@ -345,6 +346,7 @@ std::optional<SearchResult> search(SizeSource& source, int num_components, const
 
     // stable sort by Se, then by plane; sequential lines by their text
     std::vector<Line> lines;
+    lines.reserve(chosen.size());
     for (const Scan* s : chosen) lines.push_back(parse_line(*s));
     std::stable_sort(lines.begin(), lines.end(), [](const Line& a, const Line& b) {
         if (!a.has_numbers || !b.has_numbers) return a.prefix < b.prefix;

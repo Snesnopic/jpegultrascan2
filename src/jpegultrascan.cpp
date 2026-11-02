@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "engine_direct.hpp"
+#include "parallel.hpp"
 #include "pipeline.hpp"
 
 namespace jpegultrascan {
@@ -22,72 +23,96 @@ SearchOptions search_options_for(const jpeg_decompress_struct& info, const Optio
     return search_options;
 }
 
-std::optional<Script> find_best_script(const Source& source, const Options& options, VerboseLog* log,
-                                       std::string& error) {
-    const SearchOptions search_options = search_options_for(*source.info, options, log);
-    DirectEngine engine(source, search_options.max_bits, options.threads, log);
-    if (!engine.ok()) {
-        error = engine.error();
-        return std::nullopt;
+ScriptResult find_best_script(const Source& source, const Options& options, VerboseLog* log) {
+    ScriptResult result;
+    try {
+        const SearchOptions search_options = search_options_for(*source.info, options, log);
+        DirectEngine engine(source, search_options.max_bits, loop_for(options), log);
+        if (!engine.ok()) {
+            result.status = Status::Unsupported;
+            result.error = engine.error();
+            return result;
+        }
+        auto found = search(engine, source.info->num_components, search_options, result.error);
+        if (!found) {
+            // the engine fails on what libjpeg wouldn't encode
+            result.status = engine.ok() ? Status::Error : Status::Unsupported;
+            return result;
+        }
+        result.script = {std::move(found->scans), static_cast<std::size_t>(found->bytes)};
+        result.status = Status::Optimized;
+    } catch (const Stopped&) {
+        result = {};
+        result.status = Status::Interrupted;
+    } catch (const std::exception& e) {
+        result = {};
+        result.error = e.what();
     }
-    auto found = search(engine, source.info->num_components, search_options, error);
-    if (!found) return std::nullopt;
-    return Script{std::move(found->scans), static_cast<std::size_t>(found->bytes)};
+    return result;
 }
 
 }  // namespace detail
 
-std::optional<Script> find_best_script(j_decompress_ptr source, jvirt_barray_ptr* coefficients,
-                                       const Options& options) {
+ScriptResult find_best_script(j_decompress_ptr source, jvirt_barray_ptr* coefficients, const Options& options) {
+    ScriptResult result;
     try {
         detail::Source src{source, coefficients, {}};
-        std::string error;
-        if (!detail::collect_planes(src, error)) return std::nullopt;
-        auto script = detail::find_best_script(src, options, nullptr, error);
-        if (script && script->scans.size() > detail::kMaxScans) return std::nullopt;
-        return script;
-    } catch (...) {
-        return std::nullopt;
+        if (!detail::collect_planes(src, result.error)) return result;
+        result = detail::find_best_script(src, options, nullptr);
+    } catch (const std::exception& e) {
+        result = {};
+        result.error = e.what();
+        return result;
     }
+    if (result.status == Status::Optimized && result.script.scans.size() > detail::kMaxScans) {
+        result.status = Status::Unsupported;
+        result.error = "mozjpeg can't encode more than " + std::to_string(detail::kMaxScans) + " scans";
+    }
+    return result;
 }
 
-std::optional<Result> optimize(std::span<const std::uint8_t> jpeg, const Options& options, Markers markers,
-                               std::string* error) {
-    std::string local;
-    std::string& err = error ? *error : local;
+Result optimize(std::span<const std::uint8_t> jpeg, const Options& options, Markers markers) {
+    Result result;
     try {
         detail::Decoder source;
         if (!source.read(jpeg, true)) {
-            err = source.error();
-            return std::nullopt;
-        }
-        auto script = detail::find_best_script(source.source(), options, nullptr, err);
-        if (!script) return std::nullopt;
-        Result result;
-        if (script->scans.size() > detail::kMaxScans) {
-            result.data.assign(jpeg.begin(), jpeg.end());
-            result.script = std::move(*script);
+            result.error = source.error();
             return result;
         }
+        ScriptResult found = detail::find_best_script(source.source(), options, nullptr);
+        result.status = found.status;
+        result.script = std::move(found.script);
+        result.error = std::move(found.error);
+        if (result.status != Status::Optimized) return result;
+        if (result.script.scans.size() > detail::kMaxScans) {
+            result.status = Status::Unsupported;
+            result.error = "mozjpeg can't encode more than " + std::to_string(detail::kMaxScans) + " scans";
+            return result;
+        }
+        result.status = Status::Error;
         const detail::Markers mode = markers == Markers::Keep ? detail::Markers::Keep : detail::Markers::Jpegtran;
-        if (!detail::encode(source.source(), script->scans, mode, result.data, err)) return std::nullopt;
+        if (!detail::encode(source.source(), result.script.scans, mode, result.data, result.error)) {
+            result.data.clear();
+            return result;
+        }
         detail::Decoder check;
         if (!check.read(result.data, true)) {
-            err = "output doesn't decode: " + check.error();
-            return std::nullopt;
+            result.error = "output doesn't decode: " + check.error();
+            result.data.clear();
+            return result;
         }
-        if (!detail::same_image(source, check, mode == detail::Markers::Keep, err)) {
-            err = "output differs from input: " + err;
-            return std::nullopt;
+        if (!detail::same_image(source, check, mode == detail::Markers::Keep, result.error)) {
+            result.error = "output differs from input: " + result.error;
+            result.data.clear();
+            return result;
         }
-        result.script = std::move(*script);
-        result.improved = result.data.size() <= jpeg.size();
-        if (!result.improved) result.data.assign(jpeg.begin(), jpeg.end());
-        return result;
+        result.status = result.data.size() < jpeg.size() ? Status::Optimized : Status::NotSmaller;
+        if (result.status == Status::NotSmaller) result.data.clear();
     } catch (const std::exception& e) {
-        err = e.what();
-        return std::nullopt;
+        result = {};
+        result.error = e.what();
     }
+    return result;
 }
 
 }  // namespace jpegultrascan

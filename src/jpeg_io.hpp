@@ -51,6 +51,8 @@ public:
     Decoder() = default;
     Decoder(const Decoder&) = delete;
     Decoder& operator=(const Decoder&) = delete;
+    Decoder(Decoder&&) = delete;
+    Decoder& operator=(Decoder&&) = delete;
     ~Decoder();
 
     // data must outlive the decoder; memory_limit 0 means no limit

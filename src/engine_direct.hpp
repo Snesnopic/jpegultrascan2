@@ -1,10 +1,12 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
 #include "jpeg_io.hpp"
+#include "parallel.hpp"
 #include "search.hpp"
 
 namespace jpegultrascan::detail {
@@ -13,16 +15,15 @@ namespace jpegultrascan::detail {
 // Huffman tables, DHT and SOS segments, 0xFF stuffing) without encoding anything
 class DirectEngine : public SizeSource {
 public:
-    // fails when libjpeg would refuse to encode the source; error() says why
-    DirectEngine(const Source& source, int max_bits, unsigned threads, VerboseLog* log);
+    // fails when libjpeg would refuse to encode the source; error() says why. the loop's
+    // stop throws Stopped out of the measure functions
+    DirectEngine(const Source& source, int max_bits, Loop loop, VerboseLog* log);
 
     bool ok() const { return error_.empty(); }
     bool measure_ac(int component, AcSizes& out) override;
     bool measure_dc(const std::vector<int>& components, std::vector<std::uint64_t>& out) override;
     bool measure_sequential(const std::vector<std::vector<int>>& parts, std::vector<std::uint64_t>& out) override;
     const char* error() const override { return error_.c_str(); }
-
-    std::size_t scans() const { return scans_; }
 
     struct Job {
         jpeg_scan_info scan{};
@@ -34,24 +35,37 @@ public:
     bool measure(std::vector<Job>& jobs);
 
 private:
-    // per block, per Al up to max_bits: bit k set when |coefficient k in zigzag order| >> Al != 0
-    struct Masks {
+    // one component's blocks in raster order, and per Al up to max_bits a mask per block: bit
+    // k set when |coefficient k in zigzag order| >> Al != 0
+    struct AcPlane {
         int component = -1;
-        std::vector<std::uint64_t> bits;
+        std::vector<const JCOEF*> blocks;
+        std::vector<std::uint64_t> masks;  // masks[al * blocks.size() + block]
+
+        const std::uint64_t* of(int al) const { return masks.data() + static_cast<std::size_t>(al) * blocks.size(); }
+    };
+
+    // what a piece of work reuses from one AC scan to the next
+    struct Scratch {
+        std::vector<std::uint32_t> busy;
+        std::vector<std::uint32_t> tokens;
     };
 
     void size_of(Job& job) const;
-    void build_masks(int component);
+    // an AC scan of the plane's component, given its blocks with something in the band
+    bool size_ac(const jpeg_scan_info& scan, std::span<const std::uint32_t> busy, std::vector<std::uint32_t>& tokens,
+                 std::uint64_t& size) const;
+    bool measure_group(int ss, int al, AcSizes& out, Scratch& scratch) const;
+    void build_plane(int component);
 
     const Source& source_;
     int max_bits_;
-    unsigned threads_;
+    Loop loop_;
     VerboseLog* log_;
     int max_coef_bits_;
     std::vector<int> dc_tables_;
     std::vector<int> ac_tables_;
-    Masks masks_;
-    std::size_t scans_ = 0;
+    AcPlane plane_;
     std::string error_;
 };
 

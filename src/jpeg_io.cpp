@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstring>
+#include <exception>
 
 #include <jerror.h>
 
@@ -57,7 +58,7 @@ void destination_init(j_compress_ptr cinfo) {
     auto* dest = reinterpret_cast<VectorDestination*>(cinfo->dest);
     try {
         dest->out->resize(std::max<std::size_t>(dest->out->capacity(), 1 << 16));
-    } catch (...) {
+    } catch (const std::exception&) {
         dest->out->clear();
     }
     dest->pub.next_output_byte = dest->out->data();
@@ -70,7 +71,7 @@ boolean destination_grow(j_compress_ptr cinfo) {
     const std::size_t used = dest->out->size();
     try {
         dest->out->resize(used ? used * 2 : 1 << 16);
-    } catch (...) {
+    } catch (const std::exception&) {
         return FALSE;
     }
     dest->pub.next_output_byte = dest->out->data() + used;
@@ -79,7 +80,7 @@ boolean destination_grow(j_compress_ptr cinfo) {
 }
 
 void destination_term(j_compress_ptr cinfo) {
-    auto* dest = reinterpret_cast<VectorDestination*>(cinfo->dest);
+    const auto* dest = reinterpret_cast<VectorDestination*>(cinfo->dest);
     dest->out->resize(dest->out->size() - dest->pub.free_in_buffer);
 }
 
@@ -96,6 +97,8 @@ struct Encoder {
     Encoder() = default;
     Encoder(const Encoder&) = delete;
     Encoder& operator=(const Encoder&) = delete;
+    Encoder(Encoder&&) = delete;
+    Encoder& operator=(Encoder&&) = delete;
     ~Encoder() {
         if (created) jpeg_destroy_compress(&cinfo);
     }
@@ -120,8 +123,8 @@ std::size_t coefficient_bytes(const jpeg_decompress_struct& cinfo) {
     std::size_t total = 0;
     for (int ci = 0; ci < cinfo.num_components; ++ci) {
         const jpeg_component_info& c = cinfo.comp_info[ci];
-        const std::size_t h = static_cast<std::size_t>(c.h_samp_factor);
-        const std::size_t v = static_cast<std::size_t>(c.v_samp_factor);
+        const auto h = static_cast<std::size_t>(c.h_samp_factor);
+        const auto v = static_cast<std::size_t>(c.v_samp_factor);
         const std::size_t w = (c.width_in_blocks + h - 1) / h * h;
         const std::size_t rows = (c.height_in_blocks + v - 1) / v * v;
         total += w * rows * sizeof(JBLOCK);
@@ -171,13 +174,13 @@ bool Decoder::read(std::span<const std::uint8_t> data, bool save_markers, std::s
         error_ = "image too large for the memory limit";
         return false;
     }
-    jvirt_barray_ptr* coefficients = jpeg_read_coefficients(&cinfo_);
-    if (!coefficients) {
+    jvirt_barray_ptr* arrays = jpeg_read_coefficients(&cinfo_);
+    if (!arrays) {
         error_ = "no coefficients";
         return false;
     }
     source_.info = &cinfo_;
-    source_.coefficients = coefficients;
+    source_.coefficients = arrays;
     if (!collect_planes(source_, error_)) {
         source_ = {};
         return false;
@@ -190,6 +193,11 @@ namespace {
 struct ErrorSwap {
     j_decompress_ptr info;
     jpeg_error_mgr* saved;
+    ErrorSwap(j_decompress_ptr cinfo, jpeg_error_mgr* err) : info(cinfo), saved(err) {}
+    ErrorSwap(const ErrorSwap&) = delete;
+    ErrorSwap& operator=(const ErrorSwap&) = delete;
+    ErrorSwap(ErrorSwap&&) = delete;
+    ErrorSwap& operator=(ErrorSwap&&) = delete;
     ~ErrorSwap() { info->err = saved; }
 };
 
@@ -260,7 +268,7 @@ bool encode(const Source& source, std::span<const jpeg_scan_info> scans, Markers
         return false;
     }
     jpeg_create_compress(&enc.cinfo);
-    enc.created = true;
+    enc.created = true;  // cppcheck-suppress unreadVariable ; the destructor reads it
 #ifdef JPEGULTRASCAN_MOZJPEG
     // mozjpeg's default profile runs its own scan search and progression
     jpeg_c_set_int_param(&enc.cinfo, JINT_COMPRESS_PROFILE, JCP_FASTEST);
@@ -316,7 +324,7 @@ bool huffman_tables(const Source& source, std::vector<int>& dc, std::vector<int>
         return false;
     }
     jpeg_create_compress(&enc.cinfo);
-    enc.created = true;
+    enc.created = true;  // cppcheck-suppress unreadVariable ; the destructor reads it
 #ifdef JPEGULTRASCAN_MOZJPEG
     jpeg_c_set_int_param(&enc.cinfo, JINT_COMPRESS_PROFILE, JCP_FASTEST);
 #endif

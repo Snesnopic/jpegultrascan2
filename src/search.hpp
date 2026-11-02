@@ -54,6 +54,11 @@ struct VerboseLog {
 // DHT segments and SOS header included
 class SizeSource {
 public:
+    SizeSource() = default;
+    SizeSource(const SizeSource&) = delete;
+    SizeSource& operator=(const SizeSource&) = delete;
+    SizeSource(SizeSource&&) = delete;
+    SizeSource& operator=(SizeSource&&) = delete;
     virtual ~SizeSource() = default;
     // every band 1 <= Ss <= Se <= 63 of one component, each pass
     virtual bool measure_ac(int component, AcSizes& out) = 0;

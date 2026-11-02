@@ -8,8 +8,8 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <numeric>
 
-#include "parallel.hpp"
 #include "scan_script.hpp"
 
 namespace jpegultrascan::detail {
@@ -36,26 +36,38 @@ unsigned magnitude(int v) { return static_cast<unsigned>(v < 0 ? -v : v); }
 // the bits of a value as emit_bits gets them: the complement of the magnitude when negative
 std::uint32_t value_bits(int v, unsigned a) { return v < 0 ? ~a : a; }
 
-// emit_bits and flush_bits, counting bytes instead of storing them
+std::uint64_t dht_bytes(int symbols) { return 2 + 2 + 1 + 16 + static_cast<std::uint64_t>(symbols); }
+std::uint64_t sos_bytes(int components) { return 2 + 2 + 1 + 2 * static_cast<std::uint64_t>(components) + 3; }
+
+// how many bytes of a word are 0xFF, each of which gets a stuffed zero after it
+int ff_bytes(std::uint32_t word) {
+    const std::uint32_t t = ~word;
+    // the top bit of each byte of t that is zero
+    return std::popcount(~(((t & 0x7F7F7F7FU) + 0x7F7F7F7FU) | t | 0x7F7F7F7FU));
+}
+
+// emit_bits and flush_bits, counting bytes instead of storing them, four at a time
 class ByteCounter {
 public:
-    void put(std::uint32_t code, int size) {
-        buffer_ = (buffer_ << size) | (code & ((std::uint32_t{1} << size) - 1));
+    // size <= 32
+    void put(std::uint64_t code, int size) {
+        buffer_ = (buffer_ << size) | (code & ((std::uint64_t{1} << size) - 1));
         bits_ += size;
-        while (bits_ >= 8) {
-            bits_ -= 8;
-            bytes_ += ((buffer_ >> bits_) & 0xFF) == 0xFF ? 2 : 1;
+        if (bits_ >= 32) {
+            bits_ -= 32;
+            bytes_ += 4 + static_cast<std::uint64_t>(ff_bytes(static_cast<std::uint32_t>(buffer_ >> bits_)));
         }
     }
     void flush() {
         put(0x7F, 7);
+        for (; bits_ >= 8; bits_ -= 8) bytes_ += ((buffer_ >> (bits_ - 8)) & 0xFF) == 0xFF ? 2 : 1;
         buffer_ = 0;
         bits_ = 0;
     }
     std::uint64_t bytes() const { return bytes_; }
 
 private:
-    std::uint32_t buffer_ = 0;
+    std::uint64_t buffer_ = 0;
     int bits_ = 0;
     std::uint64_t bytes_ = 0;
 };
@@ -161,25 +173,74 @@ bool optimal_code(Counts freq, HuffCode& out) {
 
 // first pass of a scan: symbol counts per table
 struct Gather {
+    static constexpr bool kBits = false;
     std::array<Counts, NUM_HUFF_TBLS> dc{};
     std::array<Counts, NUM_HUFF_TBLS> ac{};
-    void dc_symbol(int tbl, int s) { ++dc[static_cast<std::size_t>(tbl)][static_cast<std::size_t>(s)]; }
-    void ac_symbol(int tbl, int s) { ++ac[static_cast<std::size_t>(tbl)][static_cast<std::size_t>(s)]; }
-    void bits(std::uint32_t, int) {}
+    void dc_symbol(int tbl, int s, std::uint32_t = 0, int = 0) {
+        ++dc[static_cast<std::size_t>(tbl)][static_cast<std::size_t>(s)];
+    }
+    void ac_symbol(int tbl, int s, std::uint32_t = 0, int = 0) {
+        ++ac[static_cast<std::size_t>(tbl)][static_cast<std::size_t>(s)];
+    }
+    static void bits(std::uint32_t, int) {}
 };
 
-// second pass: the bytes
+// second pass: the bytes. a symbol's extra bits go out with its code
 struct Emit {
+    static constexpr bool kBits = true;
     const std::array<HuffCode, NUM_HUFF_TBLS>* dc = nullptr;
     const std::array<HuffCode, NUM_HUFF_TBLS>* ac = nullptr;
     ByteCounter out;
-    void dc_symbol(int tbl, int s) { put((*dc)[static_cast<std::size_t>(tbl)], s); }
-    void ac_symbol(int tbl, int s) { put((*ac)[static_cast<std::size_t>(tbl)], s); }
+    void dc_symbol(int tbl, int s, std::uint32_t v = 0, int n = 0) { put((*dc)[static_cast<std::size_t>(tbl)], s, v, n); }
+    void ac_symbol(int tbl, int s, std::uint32_t v = 0, int n = 0) { put((*ac)[static_cast<std::size_t>(tbl)], s, v, n); }
     void bits(std::uint32_t v, int n) { out.put(v, n); }
-    void put(const HuffCode& t, int s) {
-        out.put(t.code[static_cast<std::size_t>(s)], t.size[static_cast<std::size_t>(s)]);
+    void put(const HuffCode& t, int s, std::uint32_t v, int n) {
+        const auto i = static_cast<std::size_t>(s);
+        out.put((std::uint64_t{t.code[i]} << n) | (v & ((std::uint64_t{1} << n) - 1)), t.size[i] + n);
     }
 };
+
+// the first pass of an AC scan, keeping what the second would emit: a symbol with its extra
+// bits (symbol, how many and the bits from bit 0, 8 and 13), or bits alone (bit 31 set). past
+// kMaxTokens it only counts, and the second pass walks the blocks again
+constexpr std::size_t kMaxTokens = std::size_t{1} << 22;
+
+struct Record {
+    static constexpr bool kBits = true;
+    Counts counts{};
+    std::vector<std::uint32_t>* tokens = nullptr;
+    bool kept = true;
+    void ac_symbol(int, int s, std::uint32_t v = 0, int n = 0) {
+        ++counts[static_cast<std::size_t>(s)];
+        keep(static_cast<std::uint32_t>(s), v, n);
+    }
+    void bits(std::uint32_t v, int n) { keep(std::uint32_t{1} << 31, v, n); }
+    void keep(std::uint32_t head, std::uint32_t v, int n) {
+        if (!kept) return;
+        if (tokens->size() == kMaxTokens) {
+            kept = false;
+            return;
+        }
+        tokens->push_back(head | static_cast<std::uint32_t>(n) << 8 | (v & ((std::uint32_t{1} << n) - 1)) << 13);
+    }
+};
+
+// the second pass from what the first kept
+std::uint64_t replay(std::span<const std::uint32_t> tokens, const HuffCode& code) {
+    ByteCounter out;
+    for (const std::uint32_t t : tokens) {
+        const auto n = static_cast<int>((t >> 8) & 31);
+        const std::uint64_t v = (t >> 13) & 0xFFFF;
+        if (t >> 31) {
+            out.put(v, n);
+        } else {
+            const std::size_t s = t & 0xFF;
+            out.put((std::uint64_t{code.code[s]} << n) | v, code.size[s] + n);
+        }
+    }
+    out.flush();
+    return out.bytes();
+}
 
 struct Context {
     const jpeg_decompress_struct* info;
@@ -187,8 +248,6 @@ struct Context {
     const std::vector<int>* dc_tables;
     const std::vector<int>* ac_tables;
     int max_coef_bits;
-    const std::uint64_t* masks;  // of the component of an AC scan
-    int stride;                  // masks per block
 };
 
 unsigned ceil_div(unsigned a, unsigned b) { return (a + b - 1) / b; }
@@ -197,7 +256,7 @@ unsigned ceil_div(unsigned a, unsigned b) { return (a + b - 1) / b; }
 // component's blocks row by row, or MCU by MCU with dummy blocks at the right and bottom
 // edges (zero AC, the DC of the block before)
 template <class F>
-void walk(const Context& ctx, const jpeg_scan_info& scan, F&& f) {
+void walk(const Context& ctx, const jpeg_scan_info& scan, const F& f) {
     const std::vector<Plane>& planes = *ctx.planes;
     if (scan.comps_in_scan == 1) {
         const Plane& p = planes[static_cast<std::size_t>(scan.component_index[0])];
@@ -218,15 +277,15 @@ void walk(const Context& ctx, const jpeg_scan_info& scan, F&& f) {
                 const int comp = scan.component_index[ci];
                 const jpeg_component_info& cinfo = info.comp_info[comp];
                 const Plane& p = planes[static_cast<std::size_t>(comp)];
-                const unsigned h = static_cast<unsigned>(cinfo.h_samp_factor);
-                const unsigned v = static_cast<unsigned>(cinfo.v_samp_factor);
-                const unsigned last_col_width = p.width_in_blocks % h ? p.width_in_blocks % h : h;
-                const unsigned last_row_height = p.height_in_blocks % v ? p.height_in_blocks % v : v;
+                const auto h = static_cast<unsigned>(cinfo.h_samp_factor);
+                const auto v = static_cast<unsigned>(cinfo.v_samp_factor);
+                const unsigned last_col_width = (p.width_in_blocks % h) ? p.width_in_blocks % h : h;
+                const unsigned last_row_height = (p.height_in_blocks % v) ? p.height_in_blocks % v : v;
                 const unsigned blockcnt = mx + 1 < mcus_per_row ? h : last_col_width;
                 for (unsigned y = 0; y < v; ++y) {
                     unsigned x = 0;
                     if (my + 1 < mcu_rows || y < last_row_height) {
-                        const JBLOCKROW row = p.rows[my * v + y] + mx * h;
+                        const JBLOCK* row = p.rows[my * v + y] + static_cast<std::size_t>(mx) * h;
                         for (; x < blockcnt; ++x, ++blkn) {
                             prev = row[x];
                             f(ci, prev);
@@ -259,8 +318,7 @@ bool dc_first(const Context& ctx, const jpeg_scan_info& scan, Sink& sink) {
         const unsigned a = magnitude(diff);
         const int nbits = std::bit_width(a);
         if (nbits > ctx.max_coef_bits + 1) ok = false;
-        sink.dc_symbol(tables[ci], nbits);
-        if (nbits) sink.bits(value_bits(diff, a), nbits);
+        sink.dc_symbol(tables[ci], nbits, value_bits(diff, a), nbits);
     });
     return ok;
 }
@@ -273,81 +331,101 @@ void dc_refine(const Context& ctx, const jpeg_scan_info& scan, Sink& sink) {
     });
 }
 
-template <class F>
-void each_block(const Context& ctx, int component, F&& f) {
-    const Plane& p = (*ctx.planes)[static_cast<std::size_t>(component)];
-    const std::uint64_t* masks = ctx.masks;
-    for (unsigned r = 0; r < p.height_in_blocks; ++r) {
-        const JBLOCKROW row = p.rows[r];
-        for (unsigned c = 0; c < p.width_in_blocks; ++c, masks += ctx.stride) f(static_cast<const JCOEF*>(row[c]), masks);
+// an AC scan of one component, walked through the blocks with something in the band (by
+// index, in raster order): all the others do is lengthen the EOB run
+struct AcWalk {
+    const JCOEF* const* blocks = nullptr;
+    std::size_t count = 0;                      // the component's blocks
+    std::span<const std::uint32_t> busy;
+    const std::uint64_t* masks = nullptr;       // for the scan's Al
+    const std::uint64_t* next_masks = nullptr;  // for Al + 1, in a refinement: what the earlier passes coded
+    int table = 0;
+    int max_coef_bits = 0;
+};
+
+// n blocks in a row with nothing in the band, each one more in the run
+template <class EmitRun>
+void skip_blocks(std::size_t n, unsigned& eobrun, const EmitRun& emit_eobrun) {
+    while (n) {
+        const auto take = static_cast<unsigned>(std::min<std::size_t>(n, kMaxEobrun - eobrun));
+        eobrun += take;
+        n -= take;
+        if (eobrun == kMaxEobrun) emit_eobrun();
     }
 }
 
 // encode_mcu_AC_first, the nonzero coefficients found through the masks
 template <class Sink>
-bool ac_first(const Context& ctx, const jpeg_scan_info& scan, Sink& sink) {
-    const int comp = scan.component_index[0];
-    const int tbl = (*ctx.ac_tables)[static_cast<std::size_t>(comp)];
+bool ac_first(const AcWalk& w, const jpeg_scan_info& scan, Sink& sink) {
     const std::uint64_t band = band_mask(scan.Ss, scan.Se);
     const int al = scan.Al;
     unsigned eobrun = 0;
     const auto emit_eobrun = [&] {
         const int nbits = std::bit_width(eobrun) - 1;
-        sink.ac_symbol(tbl, nbits << 4);
-        if (nbits) sink.bits(eobrun, nbits);
+        sink.ac_symbol(w.table, nbits << 4, eobrun, nbits);
         eobrun = 0;
     };
     bool ok = true;
-    each_block(ctx, comp, [&](const JCOEF* block, const std::uint64_t* masks) {
-        std::uint64_t z = masks[al] & band;
+    std::size_t next = 0;
+    for (const std::uint32_t b : w.busy) {
+        skip_blocks(b - next, eobrun, emit_eobrun);
+        next = std::size_t{b} + 1;
+        const JCOEF* block = w.blocks[b];
+        if (eobrun) emit_eobrun();
         int k = scan.Ss;
-        if (z) {
-            if (eobrun) emit_eobrun();
-            do {
-                const int pos = std::countr_zero(z);
-                int run = pos - k;
-                for (; run > 15; run -= 16) sink.ac_symbol(tbl, 0xF0);
-                const int v = block[kNatural[pos]];
-                const unsigned a = magnitude(v) >> al;
-                const int nbits = std::bit_width(a);
-                if (nbits > ctx.max_coef_bits) ok = false;
-                sink.ac_symbol(tbl, (run << 4) + nbits);
-                sink.bits(value_bits(v, a), nbits);
-                k = pos + 1;
-                z &= z - 1;
-            } while (z);
+        for (std::uint64_t z = w.masks[b] & band; z; z &= z - 1) {
+            const int pos = std::countr_zero(z);
+            int run = pos - k;
+            for (; run > 15; run -= 16) sink.ac_symbol(w.table, 0xF0);
+            const int v = block[kNatural[pos]];
+            const unsigned a = magnitude(v) >> al;
+            const int nbits = std::bit_width(a);
+            if (nbits > w.max_coef_bits) ok = false;
+            sink.ac_symbol(w.table, (run << 4) + nbits, value_bits(v, a), nbits);
+            k = pos + 1;
         }
         if (k <= scan.Se && ++eobrun == kMaxEobrun) emit_eobrun();
-    });
+    }
+    skip_blocks(w.count - next, eobrun, emit_eobrun);
     if (eobrun) emit_eobrun();
     return ok;
 }
 
 // encode_mcu_AC_refine: correction bits wait in a buffer until the next symbol
 template <class Sink>
-void ac_refine(const Context& ctx, const jpeg_scan_info& scan, Sink& sink) {
-    const int comp = scan.component_index[0];
-    const int tbl = (*ctx.ac_tables)[static_cast<std::size_t>(comp)];
+void ac_refine(const AcWalk& w, const jpeg_scan_info& scan, Sink& sink) {
     const std::uint64_t band = band_mask(scan.Ss, scan.Se);
     const int al = scan.Al;
-    std::uint8_t buffer[kMaxCorrBits];
+    std::array<std::uint8_t, kMaxCorrBits> buffer{};
     unsigned eobrun = 0;
     unsigned be = 0;
     const auto emit_buffered = [&](unsigned from, unsigned n) {
-        for (unsigned i = 0; i < n; ++i) sink.bits(buffer[from + i], 1);
+        if constexpr (Sink::kBits) {
+            while (n) {
+                const unsigned m = std::min(n, 16U);
+                std::uint32_t v = 0;
+                for (unsigned i = 0; i < m; ++i) v = (v << 1) | buffer[from + i];
+                sink.bits(v, static_cast<int>(m));
+                from += m;
+                n -= m;
+            }
+        }
     };
     const auto emit_eobrun = [&] {
         if (!eobrun) return;
         const int nbits = std::bit_width(eobrun) - 1;
-        sink.ac_symbol(tbl, nbits << 4);
-        if (nbits) sink.bits(eobrun, nbits);
+        sink.ac_symbol(w.table, nbits << 4, eobrun, nbits);
         eobrun = 0;
         emit_buffered(0, be);
         be = 0;
     };
-    each_block(ctx, comp, [&](const JCOEF* block, const std::uint64_t* masks) {
-        const std::uint64_t now = masks[al] & band;
-        const std::uint64_t fresh = now & ~masks[al + 1];
+    std::size_t next = 0;
+    for (const std::uint32_t b : w.busy) {
+        skip_blocks(b - next, eobrun, emit_eobrun);
+        next = std::size_t{b} + 1;
+        const JCOEF* block = w.blocks[b];
+        const std::uint64_t now = w.masks[b] & band;
+        const std::uint64_t fresh = now & ~w.next_masks[b];
         // the last coefficient that becomes nonzero; zero runs past it fold into the EOB
         const int eob = fresh ? 63 - std::countl_zero(fresh) : -1;
         unsigned br_start = be;
@@ -360,21 +438,21 @@ void ac_refine(const Context& ctx, const jpeg_scan_info& scan, Sink& sink) {
             k = pos + 1;
             while (run > 15 && pos <= eob) {
                 emit_eobrun();
-                sink.ac_symbol(tbl, 0xF0);
+                sink.ac_symbol(w.table, 0xF0);
                 run -= 16;
                 emit_buffered(br_start, br);
                 br_start = 0;
                 br = 0;
             }
-            const int v = block[kNatural[pos]];
+            // pos is below 64: it comes from a nonzero mask
+            const int v = block[kNatural[pos]];  // NOLINT(clang-analyzer-security.ArrayBound)
             const unsigned a = magnitude(v) >> al;
             if (a > 1) {
                 buffer[br_start + br++] = static_cast<std::uint8_t>(a & 1);
                 continue;
             }
             emit_eobrun();
-            sink.ac_symbol(tbl, (run << 4) + 1);
-            sink.bits(v < 0 ? 0 : 1, 1);
+            sink.ac_symbol(w.table, (run << 4) + 1, v < 0 ? 0 : 1, 1);
             emit_buffered(br_start, br);
             br_start = 0;
             br = 0;
@@ -386,7 +464,8 @@ void ac_refine(const Context& ctx, const jpeg_scan_info& scan, Sink& sink) {
             be += br;
             if (eobrun == kMaxEobrun || be > kMaxCorrBits - DCTSIZE2 + 1) emit_eobrun();
         }
-    });
+    }
+    skip_blocks(w.count - next, eobrun, emit_eobrun);
     emit_eobrun();
 }
 
@@ -407,8 +486,7 @@ bool sequential(const Context& ctx, const jpeg_scan_info& scan, Sink& sink) {
         unsigned a = magnitude(diff);
         int nbits = std::bit_width(a);
         if (nbits > ctx.max_coef_bits + 1) ok = false;
-        sink.dc_symbol(dc_tbl[ci], nbits);
-        if (nbits) sink.bits(value_bits(diff, a), nbits);
+        sink.dc_symbol(dc_tbl[ci], nbits, value_bits(diff, a), nbits);
         int run = 0;
         for (int k = 1; k < DCTSIZE2; ++k) {
             const int v = block[kNatural[k]];
@@ -420,8 +498,7 @@ bool sequential(const Context& ctx, const jpeg_scan_info& scan, Sink& sink) {
             a = magnitude(v);
             nbits = std::bit_width(a);
             if (nbits > ctx.max_coef_bits) ok = false;
-            sink.ac_symbol(ac_tbl[ci], (run << 4) + nbits);
-            sink.bits(value_bits(v, a), nbits);
+            sink.ac_symbol(ac_tbl[ci], (run << 4) + nbits, value_bits(v, a), nbits);
             run = 0;
         }
         if (run > 0) sink.ac_symbol(ac_tbl[ci], 0);
@@ -431,39 +508,80 @@ bool sequential(const Context& ctx, const jpeg_scan_info& scan, Sink& sink) {
 
 }  // namespace
 
-DirectEngine::DirectEngine(const Source& source, int max_bits, unsigned threads, VerboseLog* log)
-    : source_(source), max_bits_(max_bits), threads_(thread_count(threads)), log_(log),
+DirectEngine::DirectEngine(const Source& source, int max_bits, Loop loop, VerboseLog* log)
+    : source_(source), max_bits_(max_bits), loop_(std::move(loop)), log_(log),
       max_coef_bits_(source.info->data_precision + 2) {
     huffman_tables(source, dc_tables_, ac_tables_, error_);
 }
 
-void DirectEngine::build_masks(int component) {
-    if (masks_.component == component) return;
+void DirectEngine::build_plane(int component) {
+    if (plane_.component == component) return;
     const Plane& p = source_.planes[static_cast<std::size_t>(component)];
-    const std::size_t stride = static_cast<std::size_t>(max_bits_) + 1;
-    masks_.component = component;
-    masks_.bits.assign(static_cast<std::size_t>(p.width_in_blocks) * p.height_in_blocks * stride, 0);
-    std::uint64_t* m = masks_.bits.data();
+    const std::size_t count = std::size_t{p.width_in_blocks} * p.height_in_blocks;
+    plane_.component = component;
+    plane_.blocks.clear();
+    plane_.blocks.reserve(count);
     for (unsigned r = 0; r < p.height_in_blocks; ++r) {
-        for (unsigned c = 0; c < p.width_in_blocks; ++c, m += stride) {
-            const JCOEF* block = p.rows[r][c];
-            for (int k = 1; k < DCTSIZE2; ++k) {
-                const int width = std::bit_width(magnitude(block[kNatural[k]]));
-                for (int al = 0; al < width && al <= max_bits_; ++al) m[al] |= std::uint64_t{1} << k;
+        for (unsigned c = 0; c < p.width_in_blocks; ++c) plane_.blocks.push_back(p.rows[r][c]);
+    }
+    plane_.masks.assign(count * (static_cast<std::size_t>(max_bits_) + 1), 0);
+    for (std::size_t b = 0; b < count; ++b) {
+        const JCOEF* block = plane_.blocks[b];
+        for (int k = 1; k < DCTSIZE2; ++k) {
+            const int width = std::bit_width(magnitude(block[kNatural[k]]));
+            for (int al = 0; al < width && al <= max_bits_; ++al) {
+                plane_.masks[static_cast<std::size_t>(al) * count + b] |= std::uint64_t{1} << k;
             }
         }
     }
 }
 
+bool DirectEngine::size_ac(const jpeg_scan_info& scan, std::span<const std::uint32_t> busy,
+                           std::vector<std::uint32_t>& tokens, std::uint64_t& size) const {
+    const AcWalk walk{plane_.blocks.data(),
+                      plane_.blocks.size(),
+                      busy,
+                      plane_.of(scan.Al),
+                      scan.Ah ? plane_.of(scan.Al + 1) : nullptr,
+                      ac_tables_[static_cast<std::size_t>(scan.component_index[0])],
+                      max_coef_bits_};
+    tokens.clear();
+    Record record;
+    record.tokens = &tokens;
+    if (scan.Ah) ac_refine(walk, scan, record);
+    else if (!ac_first(walk, scan, record)) return false;
+    HuffCode code;
+    if (!optimal_code(record.counts, code)) return false;
+    std::uint64_t bytes = 0;
+    if (record.kept) {
+        bytes = replay(tokens, code);
+    } else {
+        std::array<HuffCode, NUM_HUFF_TBLS> ac{};
+        ac[static_cast<std::size_t>(walk.table)] = code;
+        Emit emit;
+        emit.ac = &ac;
+        if (scan.Ah) ac_refine(walk, scan, emit);
+        else ac_first(walk, scan, emit);
+        emit.out.flush();
+        bytes = emit.out.bytes();
+    }
+    size = dht_bytes(code.symbols) + sos_bytes(1) + bytes;
+    return true;
+}
+
 void DirectEngine::size_of(Job& job) const {
     const jpeg_scan_info& scan = job.scan;
-    const Context ctx{source_.info,
-                      &source_.planes,
-                      &dc_tables_,
-                      &ac_tables_,
-                      max_coef_bits_,
-                      masks_.bits.data(),
-                      max_bits_ + 1};
+    if (scan.Ss > 0 && !job.sequential) {
+        const std::uint64_t* masks = plane_.of(scan.Al);
+        const std::uint64_t band = band_mask(scan.Ss, scan.Se);
+        Scratch scratch;
+        for (std::size_t b = 0; b < plane_.blocks.size(); ++b) {
+            if (masks[b] & band) scratch.busy.push_back(static_cast<std::uint32_t>(b));
+        }
+        job.failed = !size_ac(scan, scratch.busy, scratch.tokens, job.size);
+        return;
+    }
+    const Context ctx{source_.info, &source_.planes, &dc_tables_, &ac_tables_, max_coef_bits_};
     // which tables the scan's DHT segments carry
     bool dc_used[NUM_HUFF_TBLS] = {};
     bool ac_used[NUM_HUFF_TBLS] = {};
@@ -474,13 +592,8 @@ void DirectEngine::size_of(Job& job) const {
     }
     const auto code = [&](auto& sink) {
         if (job.sequential) return sequential(ctx, scan, sink);
-        if (scan.Ss == 0) {
-            if (scan.Ah == 0) return dc_first(ctx, scan, sink);
-            dc_refine(ctx, scan, sink);
-            return true;
-        }
-        if (scan.Ah == 0) return ac_first(ctx, scan, sink);
-        ac_refine(ctx, scan, sink);
+        if (scan.Ah == 0) return dc_first(ctx, scan, sink);
+        dc_refine(ctx, scan, sink);
         return true;
     };
     Gather gather;
@@ -494,11 +607,11 @@ void DirectEngine::size_of(Job& job) const {
         const auto i = static_cast<std::size_t>(t);
         if (dc_used[t]) {
             if (!optimal_code(gather.dc[i], dc[i])) job.failed = true;
-            dht += 2 + 2 + 1 + 16 + static_cast<std::uint64_t>(dc[i].symbols);
+            dht += dht_bytes(dc[i].symbols);
         }
         if (ac_used[t]) {
             if (!optimal_code(gather.ac[i], ac[i])) job.failed = true;
-            dht += 2 + 2 + 1 + 16 + static_cast<std::uint64_t>(ac[i].symbols);
+            dht += dht_bytes(ac[i].symbols);
         }
     }
     if (job.failed) return;
@@ -507,12 +620,12 @@ void DirectEngine::size_of(Job& job) const {
     emit.ac = &ac;
     code(emit);
     emit.out.flush();
-    const std::uint64_t sos = 2 + 2 + 1 + 2 * static_cast<std::uint64_t>(scan.comps_in_scan) + 3;
-    job.size = dht + sos + emit.out.bytes();
+    job.size = dht + sos_bytes(scan.comps_in_scan) + emit.out.bytes();
 }
 
 bool DirectEngine::measure(std::vector<Job>& jobs) {
     if (!error_.empty()) return false;
+    loop_.check_stop();
     int ac_component = -1;
     for (const Job& job : jobs) {
         const jpeg_scan_info& s = job.scan;
@@ -542,15 +655,47 @@ bool DirectEngine::measure(std::vector<Job>& jobs) {
             ac_component = s.component_index[0];
         }
     }
-    if (ac_component >= 0) build_masks(ac_component);
-    parallel_for(jobs.size(), threads_, [&](std::size_t i) { size_of(jobs[i]); });
-    scans_ += jobs.size();
-    for (const Job& job : jobs) {
-        if (job.failed) {
-            error_ = "DCT coefficient out of range";
-            return false;
+    if (ac_component >= 0) build_plane(ac_component);
+    parallel_for(loop_, jobs.size(), [&](std::size_t i) {
+        loop_.check_stop();
+        size_of(jobs[i]);
+    });
+    if (std::any_of(jobs.begin(), jobs.end(), [](const Job& job) { return job.failed; })) {
+        error_ = "DCT coefficient out of range";
+        return false;
+    }
+    if (log_) {
+        for (const Job& job : jobs) log_->scan(format_scan(job.scan), job.size);
+    }
+    return true;
+}
+
+// every AC scan of the component that starts at ss and codes bit al: the first pass and,
+// below max_bits, the refinement Ah = al + 1, for each Se from 63 down. the blocks with
+// something in the band are listed once, and the list shrinks with the band
+bool DirectEngine::measure_group(int ss, int al, AcSizes& out, Scratch& scratch) const {
+    std::vector<std::uint32_t>& busy = scratch.busy;
+    const std::uint64_t* masks = plane_.of(al);
+    const std::uint64_t from = band_mask(ss, kMaxCoef);
+    busy.clear();
+    for (std::size_t b = 0; b < plane_.blocks.size(); ++b) {
+        if (masks[b] & from) busy.push_back(static_cast<std::uint32_t>(b));
+    }
+    jpeg_scan_info scan{};
+    scan.comps_in_scan = 1;
+    scan.component_index[0] = plane_.component;
+    scan.Ss = ss;
+    scan.Al = al;
+    for (int se = kMaxCoef; se >= ss; --se) {
+        const std::uint64_t band = band_mask(ss, se);
+        if (se < kMaxCoef) std::erase_if(busy, [&](std::uint32_t b) { return !(masks[b] & band); });
+        scan.Se = se;
+        scan.Ah = 0;
+        if (!size_ac(scan, busy, scratch.tokens, out.at(ss, se, 0, al))) return false;
+        if (al < max_bits_) {
+            scan.Ah = al + 1;
+            if (!size_ac(scan, busy, scratch.tokens, out.at(ss, se, al + 1, al))) return false;
         }
-        if (log_) log_->scan(format_scan(job.scan), job.size);
     }
     return true;
 }
@@ -583,24 +728,49 @@ void add_dummies(std::vector<DirectEngine::Job>& jobs, const std::vector<int>& c
 
 bool DirectEngine::measure_ac(int component, AcSizes& out) {
     if (!error_.empty()) return false;
-    std::vector<Job> jobs;
+    loop_.check_stop();
     if (log_) {
-        std::vector<int> all;
-        for (int c = 0; c < source_.info->num_components; ++c) all.push_back(c);
-        add_dummies(jobs, all);
+        std::vector<int> all(static_cast<std::size_t>(source_.info->num_components));
+        std::iota(all.begin(), all.end(), 0);
+        std::vector<Job> dummies;
+        add_dummies(dummies, all);
+        if (!measure(dummies)) return false;
     }
-    const std::size_t first = jobs.size();
-    const std::vector<int> plane{component};
-    for (int ss = 1; ss <= kMaxCoef; ++ss) {
-        for (int se = ss; se <= kMaxCoef; ++se) {
-            for (int al = 0; al <= max_bits_; ++al) jobs.push_back(make_job(plane, ss, se, 0, al));
-            for (int ah = 1; ah <= max_bits_; ++ah) jobs.push_back(make_job(plane, ss, se, ah, ah - 1));
+    build_plane(component);
+    const auto passes = static_cast<std::size_t>(max_bits_) + 1;
+    const std::size_t groups = static_cast<std::size_t>(kMaxCoef) * passes;
+    // a few pieces per thread even out the groups' work, which falls as ss grows; every group
+    // is a piece when the loop's threads aren't known
+    const std::size_t pieces = loop_.threads ? std::min<std::size_t>(groups, std::size_t{loop_.threads} * 4) : groups;
+    std::vector<char> failed(pieces, 0);
+    parallel_for(loop_, pieces, [&](std::size_t piece) {
+        Scratch scratch;
+        for (std::size_t g = piece; g < groups; g += pieces) {
+            loop_.check_stop();
+            const int ss = 1 + static_cast<int>(g / passes);
+            const int al = static_cast<int>(g % passes);
+            if (!measure_group(ss, al, out, scratch)) {
+                failed[piece] = 1;
+                return;
+            }
         }
+    });
+    if (std::find(failed.begin(), failed.end(), 1) != failed.end()) {
+        error_ = "DCT coefficient out of range";
+        return false;
     }
-    if (!measure(jobs)) return false;
-    for (std::size_t i = first; i < jobs.size(); ++i) {
-        const jpeg_scan_info& s = jobs[i].scan;
-        out.at(s.Ss, s.Se, s.Ah, s.Al) = jobs[i].size;
+    if (log_) {
+        const std::vector<int> plane{component};
+        for (int ss = 1; ss <= kMaxCoef; ++ss) {
+            for (int se = ss; se <= kMaxCoef; ++se) {
+                for (int al = 0; al <= max_bits_; ++al) {
+                    log_->scan(format_scan(make_job(plane, ss, se, 0, al).scan), out.get(ss, se, 0, al));
+                }
+                for (int ah = 1; ah <= max_bits_; ++ah) {
+                    log_->scan(format_scan(make_job(plane, ss, se, ah, ah - 1).scan), out.get(ss, se, ah, ah - 1));
+                }
+            }
+        }
     }
     return true;
 }
@@ -627,9 +797,11 @@ bool DirectEngine::measure_dc(const std::vector<int>& components, std::vector<st
 
 bool DirectEngine::measure_sequential(const std::vector<std::vector<int>>& parts, std::vector<std::uint64_t>& out) {
     std::vector<Job> jobs;
+    jobs.reserve(parts.size());
     for (const auto& part : parts) jobs.push_back(make_job(part, 0, kMaxCoef, 0, 0, true));
     if (!measure(jobs)) return false;
     out.clear();
+    out.reserve(jobs.size());
     for (const Job& job : jobs) out.push_back(job.size);
     return true;
 }

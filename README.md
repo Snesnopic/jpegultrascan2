@@ -47,12 +47,22 @@ comparing every coefficient with the input's; if it isn't smaller, the input is 
 #include <jpegultrascan/jpegultrascan.hpp>
 
 jpegultrascan::Options options;
-std::optional<jpegultrascan::Script> script =
-    jpegultrascan::find_best_script(srcinfo, coef_arrays, options);
-// set cinfo.scan_info / num_scans from script->scans, then jpeg_write_coefficients
+jpegultrascan::ScriptResult found = jpegultrascan::find_best_script(srcinfo, coef_arrays, options);
+if (found.status == jpegultrascan::Status::Optimized) {
+    // set cinfo.scan_info / num_scans from found.script.scans, then jpeg_write_coefficients
+}
 ```
 
-Link `jpegultrascan::core`. libjpeg errors never end the process.
+`optimize()` does the whole job on a JPEG in memory: search, encode, check. Both report
+`Optimized`, `NotSmaller` (optimize only), `Unsupported`, `Interrupted` or `Error`.
+
+The library is reentrant, never prints and never ends the process. It starts no threads of its
+own when the host passes its loop as `Options::parallel_for`, which then runs independent pieces
+of the search on its threads, in any order or all on the calling thread, with the same result.
+`Options::stop_requested` is polled between pieces; exceptions the host's loop throws go back to
+the host.
+
+Link `jpegultrascan::core`.
 
 ## License
 

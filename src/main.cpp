@@ -1,6 +1,8 @@
+#include <charconv>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
+#include <cstring>
+#include <exception>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -31,6 +33,16 @@ void usage() {
                stderr);
 }
 
+// a whole decimal number up to max
+bool parse_number(const char* text, unsigned max, unsigned& out) {
+    const char* end = text + std::strlen(text);
+    unsigned value = 0;
+    const auto [stop, ec] = std::from_chars(text, end, value);
+    if (ec != std::errc() || stop != end || stop == text || value > max) return false;
+    out = value;
+    return true;
+}
+
 bool read_file(const char* path, std::vector<std::uint8_t>& data) {
     std::ifstream in(path, std::ios::binary);
     if (!in) return false;
@@ -53,9 +65,7 @@ bool write_text(const char* path, const std::vector<std::string>& lines) {
     return !out.fail();
 }
 
-}  // namespace
-
-int main(int argc, char** argv) {
+int run(int argc, const char* const* argv) {
     Options options;
     const char* scans_path = nullptr;
     const char* log_path = nullptr;
@@ -67,22 +77,34 @@ int main(int argc, char** argv) {
         const std::string arg = argv[i];
         const bool has_value = i + 1 < argc;
         if (arg == "-b" && has_value) {
-            options.max_bits = std::atoi(argv[++i]);
+            unsigned bits = 0;
+            if (!parse_number(argv[++i], 1000, bits)) {
+                usage();
+                return 2;
+            }
+            options.max_bits = static_cast<int>(bits);
         } else if (arg == "-t" && has_value) {
-            options.threads = static_cast<unsigned>(std::atoi(argv[++i]));
+            if (!parse_number(argv[++i], 1024, options.threads)) {
+                usage();
+                return 2;
+            }
         } else if (arg == "--dc" && has_value) {
             const std::string m = argv[++i];
-            if (m == "upstream") options.dc = DcScans::Upstream;
-            else if (m == "interleaved") options.dc = DcScans::Interleaved;
-            else {
+            if (m == "upstream") {
+                options.dc = DcScans::Upstream;
+            } else if (m == "interleaved") {
+                options.dc = DcScans::Interleaved;
+            } else {
                 usage();
                 return 2;
             }
         } else if (arg == "--markers" && has_value) {
             const std::string m = argv[++i];
-            if (m == "keep") markers = detail::Markers::Keep;
-            else if (m == "jpegtran") markers = detail::Markers::Jpegtran;
-            else {
+            if (m == "keep") {
+                markers = detail::Markers::Keep;
+            } else if (m == "jpegtran") {
+                markers = detail::Markers::Jpegtran;
+            } else {
                 usage();
                 return 2;
             }
@@ -142,20 +164,21 @@ int main(int argc, char** argv) {
         }
         scans = *parsed;
     } else {
-        auto script = detail::find_best_script(source.source(), options, log_path ? &log : nullptr, error);
-        if (!script) {
-            std::fprintf(stderr, "%s: %s\n", files[0], error.c_str());
+        ScriptResult found = detail::find_best_script(source.source(), options, log_path ? &log : nullptr);
+        if (found.status != Status::Optimized) {
+            std::fprintf(stderr, "%s: %s\n", files[0], found.error.c_str());
             return 1;
         }
-        scans = std::move(script->scans);
+        scans = std::move(found.script.scans);
     }
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 
     // beyond mozjpeg's limit the input stays as it is; a script given by hand fails instead
     const bool encodable = scans.size() <= kMaxScans || scans_path != nullptr;
     std::vector<std::uint8_t> output;
-    if (!encodable) output = input;
-    else if (!encode(source.source(), scans, markers, output, error)) {
+    if (!encodable) {
+        output = input;
+    } else if (!encode(source.source(), scans, markers, output, error)) {
         std::fprintf(stderr, "%s: %s\n", files[0], error.c_str());
         return 1;
     }
@@ -175,15 +198,15 @@ int main(int argc, char** argv) {
     }
     if (log_path) {
         std::vector<std::string> lines = log.sizes;
-        lines.push_back("--");
+        lines.emplace_back("--");
         lines.insert(lines.end(), log.summary.begin(), log.summary.end());
-        lines.push_back("Best scans:");
+        lines.emplace_back("Best scans:");
         for (const auto& s : scans) lines.push_back(format_scan(s));
         lines.push_back("Size: " + std::to_string(encoded) + " bytes");
         char change[64];
         std::snprintf(change, sizeof change, "Change: %+.6f%%",
                       (static_cast<double>(encoded) / static_cast<double>(input.size()) - 1) * 100);
-        lines.push_back(change);
+        lines.emplace_back(change);
         if (!write_text(log_path, lines)) {
             std::fprintf(stderr, "can't write %s\n", log_path);
             return 1;
@@ -202,4 +225,15 @@ int main(int argc, char** argv) {
                      : improved ? "" : " (kept the input)");
     }
     return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {  // NOLINT(misc-const-correctness): the signature main must have
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "jpegultrascan: %s\n", e.what());
+        return 1;
+    }
 }

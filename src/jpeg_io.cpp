@@ -172,6 +172,7 @@ bool Decoder::read(std::span<const std::uint8_t> data, bool save_markers, std::s
     }
     if (memory_limit && coefficient_bytes(cinfo_) > memory_limit) {
         error_ = "image too large for the memory limit";
+        over_limit_ = true;
         return false;
     }
     jvirt_barray_ptr* arrays = jpeg_read_coefficients(&cinfo_);

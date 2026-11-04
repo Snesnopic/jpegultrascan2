@@ -514,6 +514,19 @@ DirectEngine::DirectEngine(const Source& source, int max_bits, Loop loop, Verbos
     huffman_tables(source, dc_tables_, ac_tables_, error_);
 }
 
+std::size_t DirectEngine::memory_for(const Source& source, int max_bits, unsigned pieces) {
+    std::size_t blocks = 0;
+    for (const Plane& p : source.planes) blocks = std::max(blocks, std::size_t{p.width_in_blocks} * p.height_in_blocks);
+    const auto bits = static_cast<std::size_t>(max_bits) + 1;
+    // block pointers and masks of one component
+    const std::size_t plane = blocks * (sizeof(const JCOEF*) + bits * sizeof(std::uint64_t));
+    // a piece's list of blocks, and its tokens: no more than kMaxTokens, nor 128 per block
+    const std::size_t piece = blocks * sizeof(std::uint32_t) + std::min(kMaxTokens, blocks * 128) * sizeof(std::uint32_t);
+    // the sizes of every AC scan and the search's memo, for each component and once more
+    const std::size_t sizes = (source.planes.size() + 1) * DCTSIZE2 * DCTSIZE2 * (2 * bits - 1) * 48;
+    return plane + std::size_t{std::max(pieces, 1U)} * piece + sizes;
+}
+
 void DirectEngine::build_plane(int component) {
     if (plane_.component == component) return;
     const Plane& p = source_.planes[static_cast<std::size_t>(component)];

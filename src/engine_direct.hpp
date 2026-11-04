@@ -20,6 +20,8 @@ public:
     DirectEngine(const Source& source, int max_bits, Loop loop, VerboseLog* log);
 
     bool ok() const { return error_.empty(); }
+    // the most the engine allocates for the source, with `pieces` pieces of work at once
+    static std::size_t memory_for(const Source& source, int max_bits, unsigned pieces);
     bool measure_ac(int component, AcSizes& out) override;
     bool measure_dc(const std::vector<int>& components, std::vector<std::uint64_t>& out) override;
     bool measure_sequential(const std::vector<std::vector<int>>& parts, std::vector<std::uint64_t>& out) override;

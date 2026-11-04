@@ -20,10 +20,10 @@ struct Stopped : std::exception {
     const char* what() const noexcept override { return "interrupted"; }
 };
 
+// 0: half the hardware's threads, leaving the rest to everything else
 inline unsigned thread_count(unsigned requested) {
     if (requested) return requested;
-    const unsigned hw = std::thread::hardware_concurrency();
-    return hw ? hw : 1;
+    return std::max(1U, std::thread::hardware_concurrency() / 2);
 }
 
 // the loop behind the engine when the host gives none, with the same contract: body(i) once

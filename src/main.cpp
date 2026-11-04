@@ -20,8 +20,9 @@ using namespace jpegultrascan::detail;
 void usage() {
     std::fputs("jpegultrascan " JPEGULTRASCAN_VERSION "\n"
                "usage: jpegultrascan [options] input.jpg output.jpg\n"
-               "  -b N               most successive-approximation bits per band (default 3)\n"
-               "  -t N               threads, 0 for all cores (default 0)\n"
+               "  -b N               most successive-approximation bits per band (default: as many as\n"
+               "                     libjpeg allows, 10 for 8-bit images; jpegultrascan.pl's is 3)\n"
+               "  -t N               threads, 0 for half the cores (default 0)\n"
                "  --dc MODE          upstream (default) or interleaved (like -i -1)\n"
                "  --markers MODE     keep (default): every APPn/COM segment as it is\n"
                "                     jpegtran: what jpegtran -copy all writes\n"

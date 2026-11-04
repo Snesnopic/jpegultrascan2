@@ -21,13 +21,19 @@ enum class DcScans {
 // the calling one), in any order, and returns when all are done or rethrows the first exception
 using ParallelFor = std::function<void(std::size_t n, const std::function<void(std::size_t)>& body)>;
 
+// the most successive-approximation bits libjpeg allows, for 12-bit images; 10 for 8-bit ones
+inline constexpr int kMostBits = 13;
+
 struct Options {
-    int max_bits = 3;       // most successive-approximation bits tried per band; capped at 10 for
-                            // 8-bit images and 13 for 12-bit ones, as libjpeg does
-    unsigned threads = 0;   // without parallel_for, the threads to start (0: hardware concurrency);
+    int max_bits = kMostBits;  // most successive-approximation bits tried per band (jpegultrascan's
+                               // default is 3); capped as libjpeg does. more never makes the
+                               // script bigger, as the search sees every candidate of fewer
+    unsigned threads = 0;   // without parallel_for, the threads to start (0: half the hardware's);
                             // with it, the threads behind it, which only sizes the pieces of work
                             // (0: unknown). the result never depends on it
     DcScans dc = DcScans::Upstream;
+    std::size_t memory_limit = 0;  // most bytes a call may take, estimated before it allocates:
+                                   // beyond it, Unsupported. 0: no limit
     ParallelFor parallel_for;              // empty: threads of our own
     std::function<bool()> stop_requested;  // polled between pieces of work, from any thread
                                            // running them; true stops with Interrupted
@@ -36,8 +42,9 @@ struct Options {
 enum class Status {
     Optimized,    // optimize: the output is smaller; find_best_script: a script was found
     NotSmaller,   // optimize: re-encoding didn't make the image smaller
-    Unsupported,  // libjpeg can't re-encode the image progressively, or the linked libjpeg is
-                  // mozjpeg and the script has more than 64 scans (it can't encode them)
+    Unsupported,  // libjpeg can't re-encode the image progressively, it would take more than
+                  // memory_limit, or the linked libjpeg is mozjpeg and even the script with no
+                  // successive approximation has more than 64 scans (it can't encode them)
     Interrupted,  // stop_requested returned true
     Error,
 };

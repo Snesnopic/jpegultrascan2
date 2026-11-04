@@ -23,8 +23,8 @@ Standalone, the build downloads and compiles libjpeg-turbo 3.2.0 as a static lib
 parent project already defines `JPEG::JPEG` (chisel does, with mozjpeg), that one is used
 instead: a binary can link only one libjpeg. mozjpeg is detected from its `jpeglib.h`, and its
 own scan search is switched off (`JCP_FASTEST`) before any encoding. mozjpeg 4.1.5 can't
-encode more than 64 scans (it overruns an array past that): a longer script is not used, and
-the input is kept.
+encode more than 64 scans (it overruns an array past that): the search then tries fewer bits,
+and if no script fits, the input is kept.
 
 Options: `JPEGULTRASCAN_BUILD_CLI`, `JPEGULTRASCAN_MOZJPEG` (`AUTO`, `ON`, `OFF`).
 
@@ -35,8 +35,9 @@ Binaries for Linux, macOS, Windows and FreeBSD are built by the GitHub workflow;
 
     jpegultrascan [options] input.jpg output.jpg
 
-`-b N` sets the most successive-approximation bits per band (default 3, as upstream), `-t N`
-the threads (the result never depends on it), `--dc interleaved` allows only one DC scan for
+`-b N` sets the most successive-approximation bits per band (by default as many as libjpeg
+allows, which never gives a bigger file than fewer; upstream's default is 3), `-t N` the threads
+(by default half the cores; the result never depends on it), `--dc interleaved` allows only one DC scan for
 all components (upstream's `-i -1`), `--markers jpegtran` writes what `jpegtran -copy all`
 writes instead of keeping every segment as it is. The output is checked by decoding it and
 comparing every coefficient with the input's; if it isn't smaller, the input is copied.
@@ -60,7 +61,9 @@ The library is reentrant, never prints and never ends the process. It starts no 
 own when the host passes its loop as `Options::parallel_for`, which then runs independent pieces
 of the search on its threads, in any order or all on the calling thread, with the same result.
 `Options::stop_requested` is polled between pieces; exceptions the host's loop throws go back to
-the host.
+the host. `Options::memory_limit` makes an image that would need more `Unsupported` before
+anything big is allocated. With mozjpeg, a script beyond its 64 scans is searched again with
+fewer bits, on the sizes already measured, until one fits.
 
 Link `jpegultrascan::core`.
 

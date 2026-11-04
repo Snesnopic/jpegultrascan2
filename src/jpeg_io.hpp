@@ -67,6 +67,8 @@ public:
     // the first warning, or the error
     const char* last_message() const { return err_.message; }
     const std::string& error() const { return error_; }
+    // read failed because the coefficients would take more than memory_limit
+    bool over_limit() const { return over_limit_; }
     // bytes after the end of the image that libjpeg didn't read
     std::size_t trailing_bytes() const;
 
@@ -75,6 +77,7 @@ private:
     ErrorManager err_{};
     MemorySource src_{};
     bool created_ = false;
+    bool over_limit_ = false;
     Source source_;
     std::string error_;
 };
